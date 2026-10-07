@@ -1159,10 +1159,8 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
-        if (
-            self.switcher.account_kind_for(current) == "api_key"
-            and not settings.include_api_key_accounts
-        ):
+        active_is_api_key = self.switcher.account_kind_for(current) == "api_key"
+        if active_is_api_key and not settings.include_api_key_accounts:
             self._emit(
                 NoSwitchEvent(
                     reason="active-api-key",
@@ -1173,7 +1171,42 @@ class AutoSwitchEngine:
 
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
-        if active_headroom is not None:
+        if active_is_api_key:
+            # An active API key has no quota to read: its usage is the "api key"
+            # sentinel, so its headroom is None by design. That is a resting
+            # state, not a failing poll. Counted as unhealthy, it forced a
+            # failover after `unhealthyTicks` polls onto whichever subscription
+            # still had a sliver of headroom (failover skips the threshold
+            # check), and the last-resort fallback moved back to the key a few
+            # ticks later, round and round. Hold the key until a subscription is
+            # back under the threshold, then leave it the way an exhausted
+            # account is left: at-limit ranking lands on the most headroom.
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            recovered = [
+                num
+                for num in self.switcher.switchable_account_numbers()
+                if num != current
+                and num not in quarantined
+                and self.switcher.account_kind_for(num) != "api_key"
+                and self._under_line(
+                    usage.get(num), headroom.get(num), settings, thresholds[num]
+                )
+            ]
+            if not recovered:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="active-api-key",
+                        detail=(
+                            "holding the API key until a subscription account "
+                            "is below the threshold"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            active_headroom = 0.0
+            trigger = "at-limit"
+        elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             # Each window against its OWN line, the closest one decides (see
@@ -2539,6 +2572,23 @@ class AutoSwitchEngine:
             settings.weekly_threshold,
             scale=settings.threshold,
         )
+
+    def _under_line(
+        self,
+        value: dict | str | None,
+        raw_headroom: float | None,
+        settings: AutoSwitchSettings,
+        line: float,
+        margin: float = 0.0,
+    ) -> bool:
+        """Whether an account sits under every one of its own switch lines, by
+        at least ``margin`` points: the landing test the ranking applies
+        (``not binding.over``) when ``margin`` is 0. Falls back to raw headroom
+        against ``line`` when the account reports no window."""
+        binding = self._binding(value, settings, line)
+        if binding is not None:
+            return binding.pct < binding.line - margin
+        return raw_headroom is not None and (100.0 - raw_headroom) < line - margin
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")
