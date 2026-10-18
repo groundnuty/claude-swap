@@ -1484,12 +1484,15 @@ class AutoSwitchEngine:
         )
         if (
             not ordered and api_key_candidates
-            and trigger not in ("consume-first", "priority")
+            and trigger in ("proactive", "at-limit")
             and not priority_active_ready
         ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # nudge — those API-key accounts have no weekly window to consume —
+            # and never for a usage-unknown failover: a usage endpoint that is
+            # merely failing says nothing about the subscription's quota, and
+            # must not start per-token billing.
             ordered = api_key_candidates
 
         if not ordered:
