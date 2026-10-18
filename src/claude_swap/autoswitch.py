@@ -960,10 +960,8 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
-        if (
-            self.switcher.account_kind_for(current) == "api_key"
-            and not settings.include_api_key_accounts
-        ):
+        active_is_api_key = self.switcher.account_kind_for(current) == "api_key"
+        if active_is_api_key and not settings.include_api_key_accounts:
             self._emit(
                 NoSwitchEvent(
                     reason="active-api-key",
@@ -973,7 +971,48 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
-        if active_headroom is not None:
+        returning_to: set | None = None
+        if active_is_api_key:
+            # An active API key has no quota to read: its usage is the "api key"
+            # sentinel, so its headroom is None by design. That is a resting
+            # state, not a failing poll. Counted as unhealthy, it forced a
+            # failover after `unhealthyTicks` polls onto whichever subscription
+            # still had a sliver of headroom (failover skips the threshold
+            # check), and the last-resort fallback moved back to the key a few
+            # ticks later, round and round. Hold the key until a subscription is
+            # back under the threshold, then leave it the way an exhausted
+            # account is left: at-limit ranking lands on the most headroom.
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            # Return only to a subscription a full hysteresis margin under the
+            # threshold. At the bare threshold the account crosses it again on
+            # its first requests and the engine is straight back on the key,
+            # every round trip rebuilding every session's prompt cache.
+            return_ceiling = settings.threshold - settings.hysteresis_pct
+            recovered = [
+                num
+                for num in self.switcher.switchable_account_numbers()
+                if num != current
+                and num not in quarantined
+                and self.switcher.account_kind_for(num) != "api_key"
+                and headroom.get(num) is not None
+                and (100.0 - headroom[num]) < return_ceiling
+            ]
+            returning_to = set(recovered)
+            if not recovered:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="active-api-key",
+                        detail=(
+                            "holding the API key until a subscription account "
+                            f"is below {pct_label(return_ceiling)}%"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            active_headroom = 0.0
+            trigger = "at-limit"
+        elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
@@ -1217,10 +1256,38 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if returning_to is not None:
+            # Leaving the key: land only on an account that cleared the return
+            # margin. The at-limit ranking would otherwise take any headroom
+            # (consume-first even prefers a sooner weekly reset), landing on a
+            # nearly spent account that sends the engine back to the key.
+            ordered = [n for n in ordered if n in returning_to]
+
+        if not ordered and api_key_candidates and trigger == "proactive":
+            # Before paying per token, take any subscription still under the
+            # threshold, even one that misses the best strategy's hysteresis
+            # margin. The margin stops two subscriptions flapping near the
+            # line; it was never meant to rank a metered key above quota left.
+            under = [
+                n
+                for n in oauth_candidates
+                if headroom.get(n) is not None
+                and (100.0 - headroom[n]) < settings.threshold
+            ]
+            ordered = sorted(under, key=lambda n: -(headroom[n] or 0.0))
+
+        if (
+            not ordered
+            and api_key_candidates
+            and returning_to is None
+            and trigger in ("proactive", "at-limit")
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # nudge — those API-key accounts have no weekly window to consume —
+            # and never for a usage-unknown failover: a usage endpoint that is
+            # merely failing says nothing about the subscription's quota, and
+            # must not start per-token billing.
             ordered = api_key_candidates
 
         if not ordered:

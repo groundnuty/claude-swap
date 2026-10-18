@@ -1810,6 +1810,85 @@ class TestApiKeyAccounts:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_unknown_active_usage_never_fails_over_onto_an_api_key(self, temp_home):
+        """A failing usage endpoint is not an exhausted subscription: with no
+        OAuth peer to fail over to, the engine waits instead of billing a key."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        usage = {"1": None, "2": "api key", "3": _usage(100)}
+        for _ in range(4):  # past the default unhealthy_ticks
+            h.tick_with_usage(usage)
+            h.clock.advance(60)
+        assert h.active_number() == 1
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+
+    def test_api_key_fallback_still_fires_proactively(self, temp_home):
+        """Above the threshold with every subscription spent, the key is taken
+        before the wall, so running sessions never stall at the limit."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        outcome = h.tick_with_usage({"1": _usage(96), "2": "api key", "3": _usage(97)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_best_prefers_a_subscription_with_quota_over_the_key(self, temp_home):
+        """best's hysteresis margin keeps two subscriptions from flapping; it
+        must not rank a metered key above a subscription still under the line."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True, threshold=95.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 3)
+        outcome = h.tick_with_usage({"1": _usage(96), "2": _usage(90), "3": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_active_api_key_holds_until_a_subscription_clears_the_margin(
+        self, temp_home
+    ):
+        """Back at the bare threshold the account crosses it on its first
+        requests: return only a full hysteresis margin under it."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True, threshold=95.0)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        outcome = h.tick_with_usage({"1": "api key", "2": _usage(90)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        outcome = h.tick_with_usage({"1": "api key", "2": _usage(80)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_leaving_the_key_never_lands_on_a_nearly_spent_account(self, temp_home):
+        """consume-first's escape ranks by weekly reset; leaving the key it must
+        still only land on an account that cleared the return margin."""
+        h = EngineHarness(
+            temp_home, include_api_key_accounts=True, threshold=95.0,
+            strategy="consume-first",
+        )
+        h.seed(1, "key@token.local")
+        h.seed(2, "spent@example.com")
+        h.seed(3, "fresh@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        outcome = h.tick_with_usage({
+            "1": "api key",
+            "2": _usage7(97, 30, "2026-10-19T00:00:00Z"),  # resets sooner, spent
+            "3": _usage7(50, 30, "2026-10-25T00:00:00Z"),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_active_api_key_idles_engine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "key@token.local")
@@ -1821,6 +1900,40 @@ class TestApiKeyAccounts:
         assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
             "active-api-key"
         ]
+
+    def test_included_active_api_key_rests_instead_of_failing_over(self, temp_home):
+        """An active key reads no quota by design. It must not count as an
+        unhealthy poll: after unhealthyTicks that forced a failover onto a
+        nearly spent subscription, and the fallback then went back to the key."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        for _ in range(6):  # twice the default unhealthy_ticks
+            outcome = h.tick_with_usage({"1": "api key", "2": _usage(95)})
+            assert outcome is TickOutcome.NO_ACTION
+            h.clock.advance(60)
+        assert h.active_number() == 1
+        assert h.engine._unhealthy_ticks == 0
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+
+    def test_included_active_api_key_leaves_for_a_recovered_subscription(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        outcome = h.tick_with_usage(
+            {"1": "api key", "2": _usage(95), "3": _usage(40)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
 
 
 class TestFreshening:
