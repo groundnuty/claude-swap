@@ -1249,13 +1249,10 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger == "at-limit":
+        if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Only once the active subscription is
-            # actually at its limit — never for a proactive or consume-first
-            # nudge, which would start paying while subscription quota is left,
-            # nor for a usage-unknown failover, which a merely unreadable (e.g.
-            # 429ing) usage endpoint can trigger.
+            # (unmeasurable headroom). Never for a below-threshold consume-first
+            # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
 
         if not ordered:
