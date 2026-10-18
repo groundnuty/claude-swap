@@ -1940,6 +1940,56 @@ class TestApiKeyAccounts:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_best_prefers_a_subscription_with_quota_over_the_key(self, temp_home):
+        """best's hysteresis margin keeps two subscriptions from flapping; it
+        must not rank a metered key above a subscription still under the line."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True, threshold=95.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 3)
+        outcome = h.tick_with_usage({"1": _usage(96), "2": _usage(90), "3": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_active_api_key_holds_until_a_subscription_clears_the_margin(
+        self, temp_home
+    ):
+        """Back at the bare threshold the account crosses it on its first
+        requests: return only a full hysteresis margin under it."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True, threshold=95.0)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        outcome = h.tick_with_usage({"1": "api key", "2": _usage(90)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        outcome = h.tick_with_usage({"1": "api key", "2": _usage(80)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_leaving_the_key_never_lands_on_a_nearly_spent_account(self, temp_home):
+        """consume-first's escape ranks by weekly reset; leaving the key it must
+        still only land on an account that cleared the return margin."""
+        h = EngineHarness(
+            temp_home, include_api_key_accounts=True, threshold=95.0,
+            strategy="consume-first",
+        )
+        h.seed(1, "key@token.local")
+        h.seed(2, "spent@example.com")
+        h.seed(3, "fresh@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        outcome = h.tick_with_usage({
+            "1": "api key",
+            "2": _usage7(97, 30, "2026-10-19T00:00:00Z"),  # resets sooner, spent
+            "3": _usage7(50, 30, "2026-10-25T00:00:00Z"),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_active_api_key_idles_engine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "key@token.local")
