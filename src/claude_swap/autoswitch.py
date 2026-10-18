@@ -1171,6 +1171,7 @@ class AutoSwitchEngine:
 
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
+        returning_to: set | None = None
         if active_is_api_key:
             # An active API key has no quota to read: its usage is the "api key"
             # sentinel, so its headroom is None by design. That is a resting
@@ -1183,6 +1184,10 @@ class AutoSwitchEngine:
             # account is left: at-limit ranking lands on the most headroom.
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
+            # Return only to a subscription a full hysteresis margin under its
+            # own switch lines. At the bare line the account crosses it again on
+            # its first requests and the engine is straight back on the key,
+            # every round trip rebuilding every session's prompt cache.
             recovered = [
                 num
                 for num in self.switcher.switchable_account_numbers()
@@ -1190,16 +1195,19 @@ class AutoSwitchEngine:
                 and num not in quarantined
                 and self.switcher.account_kind_for(num) != "api_key"
                 and self._under_line(
-                    usage.get(num), headroom.get(num), settings, thresholds[num]
+                    usage.get(num), headroom.get(num), settings, thresholds[num],
+                    margin=settings.hysteresis_pct,
                 )
             ]
+            returning_to = set(recovered)
             if not recovered:
                 self._emit(
                     NoSwitchEvent(
                         reason="active-api-key",
                         detail=(
                             "holding the API key until a subscription account "
-                            "is below the threshold"
+                            f"is {pct_label(settings.hysteresis_pct)} points under "
+                            "its switch line"
                         ),
                     )
                 )
@@ -1482,8 +1490,32 @@ class AutoSwitchEngine:
         priority_active_ready = priority_mode and current in switchable and self._priority_ready(
             usage.get(current), headroom.get(current), settings, thresholds[current]
         )
+        if returning_to is not None:
+            # Leaving the key: land only on an account that cleared the return
+            # margin. The at-limit ranking would otherwise take any headroom
+            # (consume-first even prefers a sooner weekly reset), landing on a
+            # nearly spent account that sends the engine back to the key.
+            ordered = [n for n in ordered if n in returning_to]
+
         if (
             not ordered and api_key_candidates
+            and trigger == "proactive"
+            and not priority_active_ready
+        ):
+            # Before paying per token, take any subscription still under its
+            # switch lines, even one that misses the best strategy's hysteresis
+            # margin. The margin stops two subscriptions flapping near the
+            # line; it was never meant to rank a metered key above quota left.
+            under = [
+                n
+                for n in oauth_candidates
+                if self._under_line(usage.get(n), headroom.get(n), settings, thresholds[n])
+            ]
+            ordered = sorted(under, key=lambda n: -(headroom.get(n) or 0.0))
+
+        if (
+            not ordered and api_key_candidates
+            and returning_to is None
             and trigger in ("proactive", "at-limit")
             and not priority_active_ready
         ):
