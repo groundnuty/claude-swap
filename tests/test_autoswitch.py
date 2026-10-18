@@ -1889,6 +1889,62 @@ class TestApiKeyAccounts:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
+    # Replays of a production log (gauge-ops, 2026-10-18). Every subscription was
+    # over the threshold; the all-above tier ranks by soonest recovery, so the
+    # engine landed on a 99% account whose 5h window reset soonest, and an agent
+    # hit "You've hit your session limit" three minutes later.
+    def _spent_fleet(self, temp_home, include):
+        h = EngineHarness(
+            temp_home, include_api_key_accounts=include, threshold=95.0,
+            strategy="consume-first",
+        )
+        h.seed(2, "m@example.com")
+        h.seed(3, "a@example.com")
+        h.seed(5, "key@token.local")
+        self._mark_api_key(h, 5)
+        now = h.clock.now
+        win = lambda pct, reset_in, pct7: {
+            "five_hour": {"pct": pct, "resets_at": _iso_at(now + reset_in)},
+            "seven_day": {"pct": pct7, "resets_at": _iso_at(now + 5 * 86400)},
+        }
+        return h, win
+
+    def test_all_spent_proactive_takes_the_key_not_a_nearly_spent_account(
+        self, temp_home
+    ):
+        # 18:11:56  #3 95% (active), #2 99% (5h resets in 8 min) -> must be the key
+        h, win = self._spent_fleet(temp_home, include=True)
+        h.make_live("a@example.com", 3)
+        outcome = h.tick_with_usage({
+            "3": win(95, 3 * 3600, 77), "2": win(99, 8 * 60, 42), "5": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 5
+
+    def test_all_spent_at_limit_takes_the_key_not_a_nearly_spent_account(
+        self, temp_home
+    ):
+        # 18:15:03  #2 100% (active), #3 95% -> must be the key, not #3
+        h, win = self._spent_fleet(temp_home, include=True)
+        h.make_live("m@example.com", 2)
+        outcome = h.tick_with_usage({
+            "2": win(100, 5 * 60, 42), "3": win(95, 3 * 3600, 77), "5": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 5
+
+    def test_without_a_key_all_spent_keeps_the_soonest_recovery_landing(
+        self, temp_home
+    ):
+        # No key to fall back on: the upstream recovery ranking is unchanged.
+        h, win = self._spent_fleet(temp_home, include=False)
+        h.make_live("a@example.com", 3)
+        outcome = h.tick_with_usage({
+            "3": win(95, 3 * 3600, 77), "2": win(99, 8 * 60, 42), "5": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     def test_active_api_key_idles_engine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "key@token.local")
