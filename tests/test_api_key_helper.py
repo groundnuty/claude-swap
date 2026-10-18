@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.api_key_helper import (
     SETTINGS_KEY,
     ApiKeyHelperChannel,
@@ -286,7 +287,7 @@ class TestActivation:
         cfg = json.loads(get_global_config_path().read_text(encoding="utf-8"))
         assert cfg["primaryApiKey"] == API_KEY
 
-    def test_keychain_storage_keeps_old_behaviour_and_drops_a_stale_hook(
+    def test_keychain_storage_registers_a_keychain_reading_hook(
         self, temp_home: Path, block_real_keychain
     ):
         s = ClaudeAccountSwitcher()
@@ -294,14 +295,39 @@ class TestActivation:
         s._setup_directories()
         s._init_sequence_file()
         ch = s._store._api_key_helper
-        # A hook left over from an earlier file-mode spell on another key.
+        # A key file left over from an earlier file-mode spell on another key.
         ch.install(OTHER_KEY)
+        assert ch.key_path.exists()
 
         s._write_credentials(API_KEY)  # lands in the (fake) Keychain
 
-        assert SETTINGS_KEY not in _settings(ch), (
-            "a stale hook would keep serving the older key"
+        assert _settings(ch)[SETTINGS_KEY] == ch.hook_command(API_KEY)
+        assert not ch.key_path.exists(), "no plaintext copy beside the Keychain"
+        script = ch.script_path.read_text(encoding="utf-8")
+        assert "find-generic-password" in script
+        assert "'Claude Code'" in script
+        assert macos_keychain.keychain_account_name() in script
+        assert API_KEY not in script
+
+    @posix_only
+    def test_keychain_script_prints_the_key_without_a_newline(
+        self, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        # `security -w` prints the value plus a newline; the helper must not.
+        stub = tmp_path / "security"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'case "$*" in *"-a me -s Claude Code -w"*) echo "' + API_KEY + '";; '
+            "*) exit 44;; esac\n",
+            encoding="utf-8",
         )
+        stub.chmod(0o755)
+        monkeypatch.setattr(macos_keychain, "_SECURITY", str(stub))
+        ch = _channel(Platform.MACOS)
+        ch.install(API_KEY, keychain_item=("Claude Code", "me"))
+        out = subprocess.run(["/bin/sh", "-c", _settings(ch)[SETTINGS_KEY]],
+                             capture_output=True, text=True, check=True)
+        assert out.stdout == API_KEY
 
 
 class TestAddAccount:

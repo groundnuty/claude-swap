@@ -35,8 +35,11 @@ Constraints that shape the implementation:
 - **A foreign ``apiKeyHelper`` is never touched.** If ``settings.json`` already
   names a different command, that is the user's own auth plumbing: cswap leaves
   it and logs why, and those users keep restart-to-pick-up behaviour.
-- **Best-effort.** No failure here may fail a switch; the caller still writes
-  ``primaryApiKey``, so a newly started session always finds the key.
+- **Best-effort.** No failure here may fail a switch; the caller still stores
+  the key where Claude Code's own ``/login`` would (``primaryApiKey``, or the
+  macOS Keychain), so a newly started session always finds it.
+- **No new plaintext copy on macOS.** When the key is in the Keychain the
+  helper reads it from there with ``security``.
 
 The approach follows realiti4/claude-swap#191 (@arthurdls), redone on current
 ``main`` with the per-key command string added.
@@ -52,6 +55,7 @@ import shlex
 import tempfile
 from pathlib import Path
 
+from claude_swap import macos_keychain
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform
 from claude_swap.paths import get_backup_root, get_claude_config_home
@@ -83,6 +87,23 @@ set -eu
 key_file={key_file}
 [ -r "$key_file" ] || exit 1
 exec cat "$key_file"
+"""
+
+# macOS with the key in the Keychain: read it from the same "Claude Code" item
+# Claude Code's own /login key uses, so no plaintext copy is written to disk.
+# Command substitution drops the newline `security -w` prints after the value.
+_KEYCHAIN_HELPER_SCRIPT = """#!/bin/sh
+# Managed by claude-swap. Do not edit: regenerated on every API-key switch and
+# removed again when an OAuth account is activated.
+#
+# Prints the API key of the active cswap account from the macOS Keychain, so
+# running Claude Code sessions pick up an API-key switch without a restart. The
+# argument is a key fingerprint that only exists to change the registered
+# command per key.
+set -eu
+key=$({security} find-generic-password -a {account} -s {service} -w)
+[ -n "$key" ] || exit 1
+printf '%s' "$key"
 """
 
 
@@ -144,10 +165,16 @@ class ApiKeyHelperChannel:
 
     # -- public API ---------------------------------------------------------
 
-    def install(self, api_key: str) -> bool:
+    def install(
+        self, api_key: str, keychain_item: tuple[str, str] | None = None
+    ) -> bool:
         """Point Claude Code's ``apiKeyHelper`` at ``api_key``. True when live.
 
-        Writes the key file and script before registering the hook, so the hook
+        ``keychain_item`` is the ``(service, account)`` the caller stored the key
+        under in the macOS Keychain; the helper then reads it from there and no
+        key file is written. Otherwise the key goes to a 0600 file.
+
+        Writes the key source and script before registering the hook, so the hook
         never names something that does not exist yet. Returns False, having
         changed nothing the caller depends on, when the channel is unavailable:
         an unsupported platform, an I/O failure, an unparsable settings file, or
@@ -156,8 +183,18 @@ class ApiKeyHelperChannel:
         if not self.supported():
             return False
         try:
-            self._atomic_write(self.key_path, api_key.strip(), mode=0o600)
-            body = _HELPER_SCRIPT.format(key_file=shlex.quote(str(self.key_path)))
+            if keychain_item is None:
+                self._atomic_write(self.key_path, api_key.strip(), mode=0o600)
+                body = _HELPER_SCRIPT.format(key_file=shlex.quote(str(self.key_path)))
+            else:
+                # A key file from an earlier file-mode spell must not linger.
+                self.key_path.unlink(missing_ok=True)
+                service, account = keychain_item
+                body = _KEYCHAIN_HELPER_SCRIPT.format(
+                    security=shlex.quote(macos_keychain._SECURITY),
+                    account=shlex.quote(account),
+                    service=shlex.quote(service),
+                )
             self._atomic_write(self.script_path, body, mode=0o700)
         except OSError as e:
             self._logger.warning(

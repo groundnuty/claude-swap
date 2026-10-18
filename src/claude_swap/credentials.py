@@ -905,13 +905,19 @@ class CredentialStore:
 
         # Running sessions never re-read the stored key: register the helper that
         # carries it to them BEFORE the OAuth credential goes away, so no session
-        # is left holding neither. A key that went to the Keychain keeps the old
-        # restart-to-pick-up behaviour, and a helper left from an earlier
-        # file-mode spell must not keep serving that older key.
-        if wrote_to_keychain:
-            self._api_key_helper.remove()
-        else:
-            self._api_key_helper.install(api_key)
+        # is left holding neither. With the key in the Keychain the helper reads
+        # it from that same item instead of a file.
+        self._api_key_helper.install(
+            api_key,
+            keychain_item=(
+                (
+                    CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
+                    macos_keychain.keychain_account_name(),
+                )
+                if wrote_to_keychain
+                else None
+            ),
+        )
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         self._clear_oauth_credential()
