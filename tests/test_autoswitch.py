@@ -1810,6 +1810,35 @@ class TestApiKeyAccounts:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_unknown_active_usage_never_fails_over_onto_an_api_key(self, temp_home):
+        """A failing usage endpoint is not an exhausted subscription: with no
+        OAuth peer to fail over to, the engine waits instead of billing a key."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        usage = {"1": None, "2": "api key", "3": _usage(100)}
+        for _ in range(4):  # past the default unhealthy_ticks
+            h.tick_with_usage(usage)
+            h.clock.advance(60)
+        assert h.active_number() == 1
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+
+    def test_api_key_fallback_still_fires_proactively(self, temp_home):
+        """Above the threshold with every subscription spent, the key is taken
+        before the wall, so running sessions never stall at the limit."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        outcome = h.tick_with_usage({"1": _usage(96), "2": "api key", "3": _usage(97)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     def test_active_api_key_idles_engine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "key@token.local")
