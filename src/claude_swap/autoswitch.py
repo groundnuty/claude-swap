@@ -1496,36 +1496,37 @@ class AutoSwitchEngine:
             # (consume-first even prefers a sooner weekly reset), landing on a
             # nearly spent account that sends the engine back to the key.
             ordered = [n for n in ordered if n in returning_to]
-
-        if (
-            not ordered and api_key_candidates
-            and trigger == "proactive"
-            and not priority_active_ready
-        ):
-            # Before paying per token, take any subscription still under its
-            # switch lines, even one that misses the best strategy's hysteresis
-            # margin. The margin stops two subscriptions flapping near the
-            # line; it was never meant to rank a metered key above quota left.
-            under = [
-                n
-                for n in oauth_candidates
-                if self._under_line(usage.get(n), headroom.get(n), settings, thresholds[n])
-            ]
-            ordered = sorted(under, key=lambda n: -(headroom.get(n) or 0.0))
-
-        if (
-            not ordered and api_key_candidates
-            and returning_to is None
+        elif (
+            api_key_candidates
             and trigger in ("proactive", "at-limit")
             and not priority_active_ready
         ):
-            # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume —
-            # and never for a usage-unknown failover: a usage endpoint that is
-            # merely failing says nothing about the subscription's quota, and
-            # must not start per-token billing.
-            ordered = api_key_candidates
+            # A key is available, so the engine must never land on a
+            # subscription at or over its switch lines. Without a key, the
+            # all-above tier rightly picks the account with the most room,
+            # since waiting is the only alternative. With one, that landing
+            # stalls within minutes. Measured: 95% -> 99% (5h window
+            # resetting in 8 min); an agent hit the session limit 3 min later.
+            def _under(n: str) -> bool:
+                return self._under_line(
+                    usage.get(n), headroom.get(n), settings, thresholds[n]
+                )
+
+            ordered = [n for n in ordered if _under(n)]
+            if not ordered:
+                # The best strategy's hysteresis margin keeps two subscriptions
+                # from flapping near the line. It was never meant to rank a
+                # metered key above a subscription with quota left.
+                ordered = sorted(
+                    (n for n in oauth_candidates if _under(n)),
+                    key=lambda n: -(headroom.get(n) or 0.0),
+                )
+            if not ordered:
+                # Last resort: every subscription is spent. Never for a
+                # below-threshold consume-first nudge, and never for a
+                # usage-unknown failover: a failing usage endpoint says nothing
+                # about the subscription's quota and must not start billing.
+                ordered = api_key_candidates
 
         if not ordered:
             if priority_active_ready:
