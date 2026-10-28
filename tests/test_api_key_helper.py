@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import macos_keychain
+from claude_swap import api_key_helper, macos_keychain
 from claude_swap.api_key_helper import (
     SETTINGS_KEY,
     ApiKeyHelperChannel,
@@ -270,6 +270,38 @@ class TestActivation:
         assert not ch.key_path.exists()
         cfg = json.loads(get_global_config_path().read_text(encoding="utf-8"))
         assert "primaryApiKey" not in cfg
+
+    def test_oauth_is_cleared_only_after_running_sessions_had_time_to_load_the_hook(
+        self, temp_home: Path, monkeypatch
+    ):
+        # Measured: a request 0.5 s after the hook was written still missed it,
+        # and with OAuth already gone it failed with "Not logged in".
+        monkeypatch.setattr(api_key_helper, "SETTLE_SECONDS", 3.0)
+        s = _linux_switcher()
+        get_credentials_path().write_text(OAUTH_JSON, encoding="utf-8")
+        events = []
+        monkeypatch.setattr(
+            api_key_helper.time, "sleep", lambda secs: events.append(("sleep", secs))
+        )
+        original = CredentialStore._clear_oauth_credential
+
+        def spy(store):
+            events.append(("clear-oauth",))
+            return original(store)
+
+        with patch.object(CredentialStore, "_clear_oauth_credential", spy):
+            s._write_credentials(API_KEY)
+
+        assert events == [("sleep", 3.0), ("clear-oauth",)]
+
+    def test_an_unchanged_hook_does_not_wait(self, temp_home: Path, monkeypatch):
+        monkeypatch.setattr(api_key_helper, "SETTLE_SECONDS", 3.0)
+        s = _linux_switcher()
+        s._write_credentials(API_KEY)
+        slept = []
+        monkeypatch.setattr(api_key_helper.time, "sleep", slept.append)
+        s._write_credentials(API_KEY)  # same key, hook already registered
+        assert slept == []
 
     def test_key_to_key_switch_changes_the_command(self, temp_home: Path):
         s = _linux_switcher()

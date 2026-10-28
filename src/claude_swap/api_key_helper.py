@@ -23,6 +23,12 @@ it outranks the claude.ai OAuth login. Measured against Claude Code 2.1.302:
   command string made the next request use the new one. So the registered
   command carries a fingerprint of the key, and a switch between two API-key
   accounts changes it.
+- a running session loads the changed ``settings.json`` a moment after the
+  write, not at once. Measured on 2.1.304, a request 0.5 s after the hook was
+  registered still had no helper while one 1 s after had it; a loaded production
+  host still missed it 1.7 s after. Clearing the OAuth login inside that window
+  leaves a request with neither credential ("Not logged in · Please run
+  /login"), and an agent stalls until something sends it a new prompt.
 
 Constraints that shape the implementation:
 
@@ -30,8 +36,9 @@ Constraints that shape the implementation:
   login, so it is registered when an API-key account is activated and removed
   when an OAuth one is, including the activation ``add_account`` performs when
   it captures a fresh ``/login``, which Claude Code cannot undo itself.
-- **Registered before OAuth is cleared, removed only after OAuth is written**, so
-  a running session never holds neither credential (the caller orders this).
+- **Registered, and given ``SETTLE_SECONDS`` to load, before OAuth is cleared;
+  removed only after OAuth is written**, so a running session never holds
+  neither credential (the caller orders this and calls ``settle``).
 - **A foreign ``apiKeyHelper`` is never touched.** If ``settings.json`` already
   names a different command, that is the user's own auth plumbing: cswap leaves
   it and logs why, and those users keep restart-to-pick-up behaviour.
@@ -50,13 +57,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import shlex
-import tempfile
+import time
 from pathlib import Path
 
 from claude_swap import macos_keychain
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text, publish_target
 from claude_swap.models import Platform
 from claude_swap.paths import get_backup_root, get_claude_config_home
 
@@ -72,6 +78,11 @@ SETTINGS_KEY = "apiKeyHelper"
 # to differ between the keys one machine switches among, and it must not leak
 # the key: settings.json is often group- or world-readable.
 FINGERPRINT_LEN = 12
+
+# How long the caller waits after registering a new hook before it clears the
+# OAuth login (see the module docstring for the measurements). About 3x the
+# worst gap observed; it only delays a switch onto an API key.
+SETTLE_SECONDS = 3.0
 
 # ``set -eu`` plus a readability probe: with the key file gone the helper must
 # fail loudly rather than print an empty key, which Claude Code would report as
@@ -123,6 +134,9 @@ class ApiKeyHelperChannel:
     def __init__(self, logger: logging.Logger, platform: Platform) -> None:
         self._logger = logger
         self._platform = platform
+        # Whether the last ``_set_hook`` rewrote settings.json. Only a rewrite
+        # needs running sessions to reload; an unchanged hook is already live.
+        self.hook_changed = False
 
     # -- locations ----------------------------------------------------------
 
@@ -204,6 +218,15 @@ class ApiKeyHelperChannel:
             return False
         return self._set_hook(self.hook_command(api_key))
 
+    def settle(self) -> None:
+        """Wait for running sessions to load a hook ``install`` just registered.
+
+        Call it between ``install`` and clearing the OAuth login. A no-op when
+        the hook was already registered.
+        """
+        if self.hook_changed and SETTLE_SECONDS > 0:
+            time.sleep(SETTLE_SECONDS)
+
     def remove(self) -> bool:
         """Unregister the hook, then delete the key file. Never raises.
 
@@ -246,6 +269,7 @@ class ApiKeyHelperChannel:
             )
             return False
 
+        self.hook_changed = False
         current = data.get(SETTINGS_KEY)
         if current == value:
             return True
@@ -269,6 +293,7 @@ class ApiKeyHelperChannel:
                 "restart to pick up API-key switches"
             )
             return False
+        self.hook_changed = True
         return True
 
     @staticmethod
@@ -298,29 +323,14 @@ class ApiKeyHelperChannel:
         target, so the link survives. An existing file keeps its mode; a file
         created here starts owner-only.
         """
-        target = path.resolve() if path.is_symlink() else path
         try:
-            mode = target.stat().st_mode & 0o777
+            mode = publish_target(path).stat().st_mode & 0o777
         except OSError:
             mode = 0o600
-        self._atomic_write(target, json.dumps(data, indent=2) + "\n", mode=mode)
+        self._atomic_write(path, json.dumps(data, indent=2) + "\n", mode=mode)
 
     @staticmethod
     def _atomic_write(path: Path, content: str, mode: int) -> None:
-        """Write via a same-directory temp file (0600 from creation) and rename."""
+        """``fsutil.atomic_write_text``, creating the parent directory first."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-        try:
-            os.write(fd, content.encode("utf-8"))
-            os.close(fd)
-            fd = -1
-            os.chmod(tmp_path, mode)
-            replace_with_retry(tmp_path, str(path))
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(path, content, mode=mode)
