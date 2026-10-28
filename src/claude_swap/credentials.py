@@ -913,7 +913,8 @@ class CredentialStore:
         # carries it to them BEFORE the OAuth credential goes away, so no session
         # is left holding neither. With the key in the Keychain the helper reads
         # it from that same item instead of a file.
-        self._api_key_helper.install(
+        helper = self._api_key_helper
+        helper.install(
             api_key,
             keychain_item=(
                 (
@@ -924,6 +925,9 @@ class CredentialStore:
                 else None
             ),
         )
+        # A running session loads the hook a moment after it is written; clearing
+        # OAuth inside that window leaves its next request with no credential.
+        helper.settle()
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         self._clear_oauth_credential()
