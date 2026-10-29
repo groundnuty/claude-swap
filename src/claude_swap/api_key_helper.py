@@ -202,7 +202,8 @@ class ApiKeyHelperChannel:
                 body = _HELPER_SCRIPT.format(key_file=shlex.quote(str(self.key_path)))
             else:
                 # A key file from an earlier file-mode spell must not linger.
-                self.key_path.unlink(missing_ok=True)
+                if self.key_path.exists():
+                    self.key_path.unlink()
                 service, account = keychain_item
                 body = _KEYCHAIN_HELPER_SCRIPT.format(
                     security=shlex.quote(macos_keychain._SECURITY),
@@ -244,7 +245,10 @@ class ApiKeyHelperChannel:
         if not self._set_hook(None):
             return False
         try:
-            self.key_path.unlink(missing_ok=True)
+            # Checked first: every OAuth activation lands here, and with no API
+            # key ever activated there is nothing in the store to touch.
+            if self.key_path.exists():
+                self.key_path.unlink()
         except OSError as e:
             self._logger.warning(f"Could not remove the active API-key file: {e}")
         return had_hook
