@@ -362,6 +362,28 @@ class TestActivation:
         assert out.stdout == API_KEY
 
 
+class TestNoStoreWritesWithoutAKey:
+    def test_oauth_activation_without_a_key_touches_no_helper_file(
+        self, temp_home: Path, monkeypatch
+    ):
+        # Every OAuth switch clears the managed key, which removes the helper.
+        # With no key ever activated that must not write or delete anything in
+        # the account store (CI's real-store guard caught a no-op unlink here).
+        s = _linux_switcher()
+        ch = s._store._api_key_helper
+        touched = []
+        original = Path.unlink
+
+        def spy(self, *args, **kwargs):
+            touched.append(self)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", spy)
+        s._write_credentials(OAUTH_JSON)
+        assert ch.key_path not in touched
+        assert not ch.settings_path.exists()
+
+
 class TestAddAccount:
     def test_capturing_a_fresh_login_removes_the_hook(
         self, temp_home: Path, mock_claude_config: Path
