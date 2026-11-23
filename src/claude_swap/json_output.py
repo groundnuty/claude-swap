@@ -12,6 +12,7 @@ import math
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace, subscription
+from claude_swap.lines import over_weekly_cap
 from claude_swap.models import AccountPolicy
 from claude_swap.poll_policy import parse_reset_ts
 
@@ -426,6 +427,15 @@ def account_row(
     # byte-identical to those from before this feature existed.
     if policy.threshold is not None:
         row["threshold"] = policy.threshold
+    # Same convention for the weekly cap; ``capped`` says whether the reading
+    # shown puts the account at or over it (absent when usage is unknown).
+    if policy.weekly_cap is not None:
+        row["weeklyCap"] = policy.weekly_cap
+        if isinstance(usage_entry, dict):
+            row["capped"] = over_weekly_cap(
+                oauth.relevant_windows(usage_entry, ()), policy.weekly_cap,
+                unknown=False,
+            )
     # Additive field: when the stored login records the expiry of its refresh
     # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
     # ``relogin_required`` that follows; absent when the login carries none.

@@ -16,6 +16,8 @@ from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
     ACCOUNT_THRESHOLD_MAX,
     ACCOUNT_THRESHOLD_MIN,
+    ACCOUNT_WEEKLY_CAP_MAX,
+    ACCOUNT_WEEKLY_CAP_MIN,
 )
 from claude_swap.printer import (
     accent,
@@ -736,6 +738,86 @@ def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
         return
     for num, value in rows:
         print(f"  Account-{num}  {value:g}%")
+
+
+def _cap_command(argv: list[str]) -> None:
+    """Handle `cswap cap [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
+
+    A weekly cap is a hard limit on one account's weekly quota: at or over
+    it, auto-switch never switches onto the account and leaves it when it is
+    active, until its weekly window resets below the cap. Pre-dispatched like
+    `threshold`; the value is validated before any file is touched.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap cap",
+        description=(
+            "Set, remove, or list a per-account weekly cap. An account at or "
+            "over its cap drops out of auto-rotation until its weekly window "
+            "resets below the cap or the cap is changed. Unlike a threshold, "
+            "a cap is never relaxed: not even when every other account is "
+            "spent."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  cswap cap 8 80                  # use at most 80% of account 8's weekly quota
+  cswap cap user@example.com 50
+  cswap cap 8 --unset             # remove the cap
+  cswap cap                       # list every cap
+
+Valid range: {ACCOUNT_WEEKLY_CAP_MIN:g}-{ACCOUNT_WEEKLY_CAP_MAX:g} (percent of the weekly quota).
+        """,
+    )
+    parser.add_argument(
+        "account", nargs="?", metavar="NUM|EMAIL",
+        help="Account to cap (number, email, or alias). Omit to list.",
+    )
+    parser.add_argument(
+        "cap", nargs="?", metavar="PCT",
+        help=(
+            f"Share of the weekly quota the account may use "
+            f"({ACCOUNT_WEEKLY_CAP_MIN:g}-{ACCOUNT_WEEKLY_CAP_MAX:g})."
+        ),
+    )
+    parser.add_argument("--unset", action="store_true", help="Remove the account's cap")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.cap:
+        parser.error("--unset does not take a PCT argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
+    if args.account is not None and not args.unset and args.cap is None:
+        parser.error("PCT is required (or pass --unset to remove the cap)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        if args.account is None:
+            rows = sorted(
+                (
+                    (num, policy.weekly_cap)
+                    for num, policy in switcher.account_policies().items()
+                    if policy.weekly_cap is not None
+                ),
+                key=lambda row: int(row[0]) if row[0].isdigit() else 0,
+            )
+            print(bolded("Weekly caps:"))
+            if not rows:
+                print(dimmed("  No account has a weekly cap"))
+            for num, value in rows:
+                print(f"  Account-{num}  {value:g}% of its weekly quota")
+            return
+        switcher.set_account_weekly_cap(args.account, None if args.unset else args.cap)
+    except ValueError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
 
 
 def _priority_command(argv: list[str]) -> None:
@@ -1478,6 +1560,9 @@ def main() -> None:
     if argv and argv[0] == "priority":
         _priority_command(argv[1:])
         return
+    if argv and argv[0] == "cap":
+        _cap_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1514,6 +1599,8 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s threshold <num|email> <pct>  set one account's switch-away point
   %(prog)s threshold <num|email> --unset  clear it (use the global default)
+  %(prog)s cap <num|email> <pct>        stop using an account at this share of its weekly quota
+  %(prog)s cap <num|email> --unset      remove the weekly cap
   %(prog)s threshold                  list the global default and overrides
   %(prog)s priority <num|email> <tier>  set priority (higher first; default 0)
   %(prog)s priority                   list account priorities

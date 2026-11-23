@@ -243,6 +243,8 @@ def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
         # ``:g`` so 75.0 reads as "75%" and 82.5 keeps its fraction — the store
         # accepts one decimal place and the row shows back exactly what was set.
         badges.append(f"{gap}th {acc.policy.threshold:g}%")
+    if acc.policy.weekly_cap is not None:
+        badges.append(f"{gap}cap {acc.policy.weekly_cap:g}%")
     return badges
 
 

@@ -105,6 +105,35 @@ def normalize_account_threshold(value: object) -> float:
     return pct
 
 
+ACCOUNT_WEEKLY_CAP_MIN = 1.0
+ACCOUNT_WEEKLY_CAP_MAX = 99.9
+
+
+def normalize_weekly_cap(value: object) -> float:
+    """Validate a per-account weekly cap (``cswap cap``); raise ValueError if
+    invalid. Same contract as :func:`normalize_account_threshold` (numeric
+    ``str`` accepted, ``bool``/NaN/infinity rejected, the message names the
+    range), over the cap's own range: a cap is a budget the account's owner
+    sets, so it may sit far below any sensible switch line."""
+    range_text = (
+        f"must be between {ACCOUNT_WEEKLY_CAP_MIN:g} and {ACCOUNT_WEEKLY_CAP_MAX:g}"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"weekly cap {range_text}, got {value!r}")
+    if isinstance(value, str):
+        try:
+            pct = float(value.strip())
+        except ValueError:
+            raise ValueError(f"weekly cap {range_text}, got {value!r}") from None
+    else:
+        pct = float(value)
+    if math.isnan(pct) or math.isinf(pct):
+        raise ValueError(f"weekly cap {range_text}, got {value!r}")
+    if not ACCOUNT_WEEKLY_CAP_MIN <= pct <= ACCOUNT_WEEKLY_CAP_MAX:
+        raise ValueError(f"weekly cap {range_text}, got {pct:g}")
+    return pct
+
+
 ACCOUNT_PRIORITY_MAX = 1000
 
 
@@ -140,12 +169,19 @@ class AccountPolicy:
         on one shared account no longer means taxing the whole fleet with a
         global line set to the strictest member's.
 
+    ``weekly_cap``
+        A hard ceiling on this account's account-wide weekly (7d) usage, in
+        percent. At or over it the account is never a switch target and, when
+        active, is left at once; it rejoins rotation by itself when its weekly
+        window resets below the cap. ``None`` means no cap.
+
     Frozen because ``AccountSnapshot`` is frozen — a mutable member would
     silently break that guarantee for the whole row.
     """
 
     threshold: float | None = None
     priority: int = 0
+    weekly_cap: float | None = None
 
 
 class Platform(Enum):

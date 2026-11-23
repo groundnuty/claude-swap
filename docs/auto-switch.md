@@ -27,6 +27,16 @@ One threshold compared against the busiest window forces the same number on wind
 
 `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one: auto-switch leaves that account when *its* line is reached and prefers candidates still under *theirs*, with ranking and the hysteresis margin counting room under each account's own line rather than raw headroom. Like the global threshold it is a switch-away line, not a hard cap — with nothing under its line, or the active account at its limit, it still lands somewhere rather than stall (`priority-consume-first` is the exception: it holds, see below). With a weekly line set, the override applies to the 5-hour window only. Accounts without one keep the global threshold. `cswap threshold` alone lists the default and every override, `--unset` clears one, and the [TUI](../README.md#interactive-dashboard-tui) shows a `th 85%` badge.
 
+## Per-account weekly cap
+
+`cswap cap <num|email> <pct>` caps one account at a share of its weekly quota (1–99.9), for an account you may only use so far, such as a colleague's. Unlike a threshold, a cap is a hard limit. Once the account's account-wide 7-day window reaches it:
+
+- auto-switch never switches onto the account, under any strategy, even when every other account is over its lines;
+- an active capped account is left at once, cooldown or not, and the log says why (`Account-8 is at its weekly cap (7d 80% >= 80%): leaving it until its weekly reset`);
+- with nowhere else to go, the engine holds (`no switch: weekly-cap`), or takes the API key where `includeApiKeyAccounts` allows it.
+
+The account comes back by itself when its weekly window resets below the cap, or at once when you raise or remove the cap (`cswap cap <num|email> --unset`). An account whose weekly usage can't be read is not switched onto, but an active one is not forced off without a reading. `cswap cap` alone lists the caps. `cswap list` shows `(cap 80%)`, or `(capped: 7d 81% >= 80%)` once it is reached; `--json` adds `weeklyCap` and `capped`, and the TUI shows a `cap 80%` badge. A cap is carried across a `--slot` re-add. A manual `cswap switch` doesn't check caps.
+
 ## Account priority tiers
 
 `cswap priority <num|email> <tier>` ranks an account for the `priority-consume-first` strategy: higher tiers are used first, accounts without one are tier 0 (valid tiers are 0–1000), and within a tier the account whose weekly window resets soonest goes first. It moves back to a higher tier as soon as that account is usable again (after the cooldown), and it never lands on an account at or over its switch lines — when nothing qualifies, even at the limit, it holds and keeps polling instead of relaxing them. Tiers alone change nothing; `best`, `weekly-first`, `consume-first`, and manual switching ignore them. It uses neither the hysteresis margin nor the exhausted slow cadence described above: equal tiers and reset times keep the active account, and a blocked state keeps polling at the normal interval. `cswap priority` lists every account's tier and `--unset` clears one.

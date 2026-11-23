@@ -52,7 +52,13 @@ from typing import ClassVar
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
-from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
+from claude_swap.lines import (
+    BindingWindow,
+    binding_window,
+    line_room,
+    over_weekly_cap,
+    window_line,
+)
 from claude_swap.locking import FileLock
 from claude_swap.models import AccountPolicy
 from claude_swap.poll_policy import (
@@ -410,6 +416,26 @@ class UnquarantineEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return f"Account-{self.number} ({self.email}) back in rotation ({self.reason})"
+
+
+@dataclass(frozen=True)
+class WeeklyCapEvent(AutoSwitchEvent):
+    """The active account reached its weekly cap (``cswap cap``)."""
+
+    kind: ClassVar[str] = "weekly-cap"
+    account: dict | None  # account_ref shape
+    pct: float
+    cap: float
+
+    def _fields(self) -> dict:
+        return {"account": self.account, "pct": self.pct, "cap": self.cap}
+
+    def human(self) -> str:
+        num = self.account.get("number") if self.account else "?"
+        return (
+            f"Account-{num} is at its weekly cap (7d {pct_label(self.pct)}% >= "
+            f"{pct_label(self.cap)}%): leaving it until its weekly reset"
+        )
 
 
 @dataclass(frozen=True)
@@ -1183,6 +1209,7 @@ class AutoSwitchEngine:
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
         returning_to: set | None = None
+        capped_active = False
         if active_is_api_key:
             # An active API key has no quota to read: its usage is the "api key"
             # sentinel, so its headroom is None by design. That is a resting
@@ -1205,6 +1232,7 @@ class AutoSwitchEngine:
                 if num != current
                 and num not in quarantined
                 and self.switcher.account_kind_for(num) != "api_key"
+                and not self._over_cap(num, usage.get(num), policies, unknown=True)
                 and self._under_line(
                     usage.get(num), headroom.get(num), settings, thresholds[num],
                     margin=settings.hysteresis_pct,
@@ -1239,7 +1267,15 @@ class AutoSwitchEngine:
                 if active_binding is not None
                 else (100.0 - active_headroom) < thresholds[current]
             )
-            if below:
+            capped_active = self._over_cap(
+                current, usage.get(current), policies, unknown=False
+            )
+            if capped_active:
+                # A weekly cap is a hard stop, not a line: leave now, past the
+                # cooldown, the way an exhausted account is left.
+                self._emit_weekly_cap(current, usage.get(current), policies)
+                trigger = "at-limit"
+            elif below:
                 if settings.strategy != "consume-first" and not priority_mode:
                     self._emit(
                         NoSwitchEvent(
@@ -1324,6 +1360,18 @@ class AutoSwitchEngine:
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
+
+        def _uncapped(nums: list[str], use: dict) -> list[str]:
+            # An account at its weekly cap is out of rotation until its weekly
+            # window resets below the cap: never a landing, under any strategy
+            # and in every fallback, an unreadable budget included.
+            return [
+                n for n in nums
+                if not self._over_cap(n, use.get(n), policies, unknown=True)
+            ]
+
+        capped_out = [n for n in oauth_candidates if n not in _uncapped(oauth_candidates, usage)]
+        oauth_candidates = [n for n in oauth_candidates if n not in capped_out]
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
@@ -1355,6 +1403,15 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
+        if not oauth_candidates and not api_key_candidates and capped_out:
+            # Everything else is capped: a weekly reset or a raised cap
+            # changes that, so keep polling at the normal cadence.
+            self._emit(NoSwitchEvent(
+                reason="weekly-cap",
+                detail="every other account is at its weekly cap: "
+                + ", ".join(f"Account-{n}" for n in capped_out),
+            ))
+            return TickOutcome.BLOCKED
         if not oauth_candidates and not api_key_candidates:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
@@ -1414,7 +1471,8 @@ class AutoSwitchEngine:
                 return self._rank_priority_candidates(
                     oauth_candidates=kw["oauth_candidates"],
                     usage=kw["usage"], headroom=kw["headroom"],
-                    current=current, active_enabled=current in switchable,
+                    current=current,
+                    active_enabled=current in switchable and not capped_active,
                     settings=settings, now=kw["now"], thresholds=thresholds,
                     policies=policies,
                 )
@@ -1484,6 +1542,8 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
+            # A candidate can reach its weekly cap between the two readings.
+            oauth_candidates = _uncapped(oauth_candidates, usage)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
@@ -1498,7 +1558,7 @@ class AutoSwitchEngine:
                 thresholds=thresholds,
             )
 
-        priority_active_ready = priority_mode and current in switchable and self._priority_ready(
+        priority_active_ready = priority_mode and current in switchable and not capped_active and self._priority_ready(
             usage.get(current), headroom.get(current), settings, thresholds[current]
         )
         if returning_to is not None:
@@ -2690,6 +2750,41 @@ class AutoSwitchEngine:
             line,
             settings.weekly_threshold,
         )
+
+    def _over_cap(
+        self,
+        num: str,
+        value: dict | str | None,
+        policies: dict[str, AccountPolicy],
+        *,
+        unknown: bool,
+    ) -> bool:
+        """Whether ``num`` is at or over its own weekly cap (``cswap cap``)."""
+        policy = policies.get(num)
+        return over_weekly_cap(
+            oauth.relevant_windows(
+                value if isinstance(value, dict) else None, self._models
+            ),
+            policy.weekly_cap if policy is not None else None,
+            unknown=unknown,
+        )
+
+    def _emit_weekly_cap(
+        self, num: str, value: dict | str | None, policies: dict[str, AccountPolicy]
+    ) -> None:
+        pct = next(
+            (p for label, p, _ in oauth.relevant_windows(
+                value if isinstance(value, dict) else None, self._models
+            ) if label == "7d"),
+            None,
+        )
+        policy = policies.get(num)
+        if pct is None or policy is None or policy.weekly_cap is None:
+            return
+        self._emit(WeeklyCapEvent(
+            account=_ref(num, self.switcher.account_email(num)),
+            pct=pct, cap=policy.weekly_cap,
+        ))
 
     def _under_line(
         self,

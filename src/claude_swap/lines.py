@@ -91,6 +91,31 @@ def line_room(
     return min(rooms) if rooms else None
 
 
+WEEKLY_LABEL = "7d"
+
+
+def over_weekly_cap(
+    windows: Iterable[tuple[str, float, str | None]],
+    cap: float | None,
+    *,
+    unknown: bool,
+) -> bool:
+    """Whether the account-wide weekly window is at or over ``cap``.
+
+    A cap is not a line: lines decide when to leave and rank where to land,
+    a cap removes the account from rotation outright (see
+    ``AccountPolicy.weekly_cap``). ``unknown`` is the answer when the weekly
+    window isn't reported: a landing must not trust an unread budget, while
+    a departure needs evidence.
+    """
+    if cap is None:
+        return False
+    for label, pct, _ in windows:
+        if label == WEEKLY_LABEL:
+            return pct >= cap
+    return unknown
+
+
 @dataclass(frozen=True)
 class BindingWindow:
     """The window holding an account back, with the numbers the engine

@@ -26,6 +26,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap import oauth, pace, subscription
+from claude_swap.lines import WEEKLY_LABEL
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -67,6 +68,7 @@ from claude_swap.models import (
     get_timestamp,
     normalize_account_priority,
     normalize_account_threshold,
+    normalize_weekly_cap,
     normalize_alias,
     org_tag_shown,
 )
@@ -316,6 +318,24 @@ def last_seen_note(entry: UsageEntry) -> str | None:
         f"last seen {100 - headroom:.0f}% used · "
         f"{format_age(int(entry.fetched_at * 1000))}"
     )
+
+
+def _weekly_cap_marker(cap: float | None, entry: object) -> str:
+    """`(cap 80%)`, or `(capped: 7d 81% >= 80%)` once the weekly reading
+    reaches the cap; empty for an account without one."""
+    if cap is None:
+        return ""
+    # A list entry is a UsageEntry; its last good reading is what the list shows.
+    usage = getattr(entry, "last_good", entry)
+    pct = next(
+        (p for label, p, _ in oauth.relevant_windows(
+            usage if isinstance(usage, dict) else None, ()
+        ) if label == WEEKLY_LABEL),
+        None,
+    )
+    if pct is not None and pct >= cap:
+        return f" {muted(f'(capped: 7d {pct:.0f}% >= {cap:g}%)')}"
+    return f" {muted(f'(cap {cap:g}%)')}"
 
 
 def _plan_marker(record: dict | None, now: float) -> str:
@@ -2151,7 +2171,9 @@ class ClaudeAccountSwitcher:
     #: rewrites from the new credential. ``add_account`` and
     #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
     #: carry exactly these across; a new per-account setting belongs here.
-    USER_ACCOUNT_SETTINGS: tuple[str, ...] = ("alias", "disabled", "threshold", "priority")
+    USER_ACCOUNT_SETTINGS: tuple[str, ...] = (
+        "alias", "disabled", "threshold", "priority", "weeklyCap",
+    )
 
     @classmethod
     def _carried_settings(cls, record: dict | None) -> dict:
@@ -2211,7 +2233,14 @@ class ClaudeAccountSwitcher:
             priority = normalize_account_priority(record.get("priority", 0))
         except ValueError:
             priority = 0
-        return AccountPolicy(threshold=threshold, priority=priority)
+        weekly_cap: float | None = None
+        if record.get("weeklyCap") is not None:
+            try:
+                weekly_cap = normalize_weekly_cap(record["weeklyCap"])
+            except ValueError:
+                # Unreadable reads as no cap, like an unreadable threshold.
+                weekly_cap = None
+        return AccountPolicy(threshold=threshold, priority=priority, weekly_cap=weekly_cap)
 
     def account_policies(self) -> dict[str, AccountPolicy]:
         """Every managed slot's auto-switch policy, from one sequence read.
@@ -2265,6 +2294,60 @@ class ClaudeAccountSwitcher:
         if not record:
             raise AccountNotFoundError(f"Account-{account_num} does not exist")
         return account_num, email, data, record
+
+    def set_account_weekly_cap(self, identifier: str, cap: object | None) -> None:
+        """Set or clear one account's weekly cap (``cswap cap``).
+
+        At or over the cap on its account-wide weekly window, the account is
+        never a switch target for auto-switch under any strategy, including
+        when every other account is over its lines, and an active one is
+        left at once. It rejoins rotation by itself when its weekly window
+        resets below the cap, or when the cap is raised or cleared.
+        ``cap=None`` clears it; the key is popped rather than stored as null.
+
+        Raises:
+            ConfigError: No accounts are managed yet, the email is ambiguous,
+                or the account is an API key (it has no weekly window).
+            AccountNotFoundError: The identifier matches no managed account.
+            ValueError: The value is not a number in range, raised before
+                any write.
+        """
+        normalized = None if cap is None else normalize_weekly_cap(cap)
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+        if normalized is not None and self._account_kind(account_num) == "api_key":
+            raise ConfigError(
+                f"Account-{account_num} ({email}) is an API key: it has no weekly "
+                "quota to cap"
+            )
+
+        current = record.get("weeklyCap")
+        if normalized is None and "weeklyCap" not in record:
+            print(dimmed(f"Account-{account_num} ({email}) has no weekly cap."))
+            return
+        if normalized is not None and current == normalized:
+            print(dimmed(
+                f"Account-{account_num} ({email}) is already capped at {normalized:g}% "
+                "of its weekly quota."
+            ))
+            return
+
+        if normalized is None:
+            record.pop("weeklyCap", None)
+        else:
+            record["weeklyCap"] = normalized
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        if normalized is None:
+            self._logger.info(f"Cleared weekly cap for account {account_num}: {email}")
+            print(f"{accent('Cleared')} the weekly cap of Account-{account_num} ({email}).")
+        else:
+            self._logger.info(
+                f"Set weekly cap {normalized:g} for account {account_num}: {email}"
+            )
+            print(f"{accent('Capped')} Account-{account_num} ({email}) at "
+                  f"{normalized:g}% of its weekly quota: auto-switch leaves it there "
+                  "and won't return before its weekly reset.")
 
     def set_account_threshold(self, identifier: str, threshold: object | None) -> None:
         """Set or clear one account's own switch-away threshold.
@@ -6418,6 +6501,10 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            markers += _weekly_cap_marker(
+                self._policy_from_data(seq_data, str(num)).weekly_cap,
+                entries[str(num)],
+            )
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label}{tag}{markers}")
             login_expires_at = oauth.login_expires_at_epoch(creds)
